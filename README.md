@@ -53,6 +53,7 @@ The controller requests confirmation before starting online guidance:
 
 Enter `y` or `yes` to approve execution. Any other response stops the controller without starting the mission.
 
+> [!Warning]
 > **Safety warning:** Do not approve the simulation unless the plotted trajectory, waypoints, altitude, wind conditions, and expected vehicle behavior have been checked. Always test the complete workflow in ArduPilot SITL before using a real aircraft.
 
 ---
