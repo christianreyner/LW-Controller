@@ -13,8 +13,8 @@ The project combines:
 - ArduPilot SITL integration
 - Online guidance using MAVLink and RC overrides
 - Conventional-versus-optimized trajectory comparison
-- QGroundControl waypoint-file generation
-- Lawn-mower survey mission generation
+- Waypoint-file generation
+- Boustrophedon survey mission generation
 
 > **Warning:** This controller will communicate with and control an aircraft through MAVLink. Use it only in a controlled simulation or test environment. Always verify vehicle configuration, geofencing, failsafes, flight modes, and recovery procedures before attempting flight.
 
