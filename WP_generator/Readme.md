@@ -1,8 +1,8 @@
 # Waypoint Generator
 
-The waypoint generator creates survey missions in QGroundControl WPL 110 format.
+The waypoint generator creates survey missions in Mission Planner.
 
-Generated waypoint files can be imported into QGroundControl and uploaded to an ArduPilot vehicle or SITL instance.
+Generated waypoint files can be imported into Mission Planner and uploaded to an ArduPilot vehicle or SITL instance.
 
 ## Usage
 
