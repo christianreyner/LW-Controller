@@ -26,6 +26,7 @@ from uav_opt.angles import wrap_2pi
 from uav_opt.config import AppConfig
 from uav_opt.mavlink_client import MavlinkClient
 from uav_opt.mission_io import save_mavlink_mission, load_navigation_plan_from_wpl
+from uav_opt.path_utils import export_path_to_csv
 from uav_opt.planner import OptimalPathPlanner
 from uav_opt.simulator import (
     simulate_l1_path,
@@ -48,11 +49,38 @@ def main() -> None:
     mav = MavlinkClient.connect(cfg.execution.connection_string)
 
     # ---------------------------------------------------------------------
+    # 1.5. Apply airspeed correction
+    # ---------------------------------------------------------------------
+    # Read EAS-to-TAS ratio from barometric pressure and temperature.
+    e2t = mav.get_e2t(timeout=2.0)
+ 
+    original_airspeed_mps = cfg.aircraft.airspeed_mps
+    adjusted_airspeed_mps = original_airspeed_mps * e2t
+
+    print(f"EAS2TAS ratio: {e2t:.6f}")
+    print(f"Configured airspeed: {original_airspeed_mps:.3f} m/s")
+    print(f"Adjusted airspeed: {adjusted_airspeed_mps:.3f} m/s")
+
+    # AircraftConfig is frozen, so create a modified copy.
+    adjusted_aircraft = replace(
+        cfg.aircraft,
+        airspeed_mps=adjusted_airspeed_mps,
+    )
+
+    # Replace the aircraft configuration inside the application config.
+    cfg = replace(
+        cfg,
+        aircraft=adjusted_aircraft,
+    )
+
+    # ---------------------------------------------------------------------
     # 2. Download mission from autopilot and save it
     # ---------------------------------------------------------------------
     mission_items = mav.download_mission()
     if not mission_items:
         raise RuntimeError("Autopilot mission is empty or could not be downloaded.")
+
+    mav.ensure_home_matches_mission(mission_items)
 
     save_mavlink_mission(mission_items, temp_mission_path)
     print(f"Mission saved to: {temp_mission_path}")
@@ -68,11 +96,27 @@ def main() -> None:
     print(f"Start mission seq: {plan.start_seq}")
     print(f"Landing sequence available: {plan.do_land}, land_seq={plan.land_seq}")
 
+    print("Planner inputs:")
+    print(f"  airspeed_mps = {cfg.aircraft.airspeed_mps}")
+    print(f"  wind speed = {cfg.l1.wind_speed_mps}")
+    print(f"  wind direction = {cfg.l1.wind_from_direction_rad}")
+    print(
+        "  wind-aware solver =",
+        cfg.l1.use_wind_aware_bank_solver,
+    )
+
     # ---------------------------------------------------------------------
     # 4. Plan optimal path
     # ---------------------------------------------------------------------
     planner = OptimalPathPlanner(cfg.aircraft, cfg.l1)
     planned_path = planner.plan(plan.waypoints_utm)
+    optimal_path_csv = Path("optimal_path.csv")
+
+    export_path_to_csv(
+        path_xy=planned_path.optimal_path_utm,
+        output_file=optimal_path_csv,
+        path_name="optimal",
+    )
 
     print(f"Optimal path points: {len(planned_path.optimal_path_utm)}")
     print(f"Path split into {len(planned_path.subarrays)} segments.")
