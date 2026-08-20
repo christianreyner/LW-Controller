@@ -1,4 +1,6 @@
+import csv
 import numpy as np
+from pathlib import Path
 
 
 def dynamic_split_2d(path_xy: np.ndarray, threshold_m: float = 10.0) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -225,3 +227,45 @@ def stack_with_next_segment(
             stacked_y = np.hstack([current_y, next_y])
 
     return stacked_x, stacked_y
+
+def export_path_to_csv(path_xy, output_file: Path, path_name: str = "optimal") -> None:
+    """
+    Export an Nx2 path array to CSV.
+
+    Parameters
+    ----------
+    path_xy:
+        Array-like object with columns [x, y], typically UTM coordinates.
+    output_file:
+        Destination CSV file.
+    path_name:
+        Name stored in the CSV file.
+    """
+    path_xy = np.asarray(path_xy)
+
+    if path_xy.ndim != 2 or path_xy.shape[1] < 2:
+        raise ValueError(
+            f"Expected path with shape Nx2, got {path_xy.shape}"
+        )
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_file.open("w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "index",
+            "path",
+            "x_utm_m",
+            "y_utm_m",
+        ])
+
+        for index, point in enumerate(path_xy):
+            writer.writerow([
+                index,
+                path_name,
+                float(point[0]),
+                float(point[1]),
+            ])
+
+    print(f"{path_name.capitalize()} path exported to: {output_file}")
