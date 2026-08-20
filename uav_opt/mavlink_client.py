@@ -32,6 +32,7 @@ class MavlinkClient:
         )
         return cls(master)
 
+
     # ------------------------------------------------------------------
     # Mission download
     # ------------------------------------------------------------------
@@ -183,10 +184,65 @@ class MavlinkClient:
     # ------------------------------------------------------------------
     # Home / takeoff / climb
     # ------------------------------------------------------------------
+    def get_e2t(
+        self,
+        timeout: float = 2.0,
+        max_temperature_c: float = 35.0,
+    ) -> float:
+        """
+        Calculate the EAS-to-TAS ratio from MAVLink barometric pressure
+        and temperature.
+
+        SCALED_PRESSURE fields:
+            press_abs: hPa
+            temperature: centi-degrees Celsius
+        """
+
+        msg = self.master.recv_match(
+            type="SCALED_PRESSURE",
+            blocking=True,
+            timeout=timeout,
+        )
+
+        if msg is None:
+            raise TimeoutError(
+                "Timed out waiting for SCALED_PRESSURE."
+            )
+
+        pressure_pa = float(msg.press_abs) * 100.0
+        temperature_c = float(msg.temperature) / 100.0
+
+        # This follows ArduPilot's fallback behavior:
+        # barometer temperature is limited to 35 degC.
+        temperature_c = min(temperature_c, max_temperature_c)
+
+        temperature_k = temperature_c + 273.15
+
+        if pressure_pa <= 0.0:
+            raise ValueError(f"Invalid barometric pressure: {pressure_pa}")
+
+        if temperature_k <= 0.0:
+            raise ValueError(f"Invalid temperature: {temperature_k}")
+
+        # Specific gas constant for dry air.
+        R_AIR = 287.05
+        SEA_LEVEL_DENSITY = 1.225
+
+        air_density = pressure_pa / (R_AIR * temperature_k)
+
+        e2t = math.sqrt(SEA_LEVEL_DENSITY / air_density)
+
+        return float(e2t)
+
     def reset_home_position(self) -> None:
         print("Resetting home position to current location...")
 
-        msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=10.0)
+        msg = self.master.recv_match(
+            type="GLOBAL_POSITION_INT",
+            blocking=True,
+            timeout=10.0,
+        )
+
         if msg is None:
             raise RuntimeError("No GLOBAL_POSITION_INT for reset_home_position.")
 
@@ -205,6 +261,263 @@ class MavlinkClient:
         )
 
         print("Home position reset command sent.")
+
+    def ensure_home_matches_mission(
+        self,
+        mission_items,
+        position_tolerance_m: float = 1.0,
+        altitude_tolerance_m: float = 0.5,
+    ) -> None:
+        """
+        Compare the autopilot HOME_POSITION with mission item 0.
+
+        If the positions differ, set the autopilot home position to the
+        coordinates and absolute altitude from mission item 0.
+        """
+
+        expected_home = self._extract_home_from_mission(mission_items)
+        actual_home = self._get_home_position()
+
+        print(
+            "Mission home: "
+            f"lat={expected_home['lat']:.8f}, "
+            f"lon={expected_home['lon']:.8f}, "
+            f"alt={expected_home['alt']:.3f} m"
+        )
+
+        print(
+            "Autopilot home: "
+            f"lat={actual_home['lat']:.8f}, "
+            f"lon={actual_home['lon']:.8f}, "
+            f"alt={actual_home['alt']:.3f} m"
+        )
+
+        if self._home_matches(
+            expected_home,
+            actual_home,
+            position_tolerance_m,
+            altitude_tolerance_m,
+        ):
+            print("Autopilot home already matches mission home.")
+            return
+
+        print("Autopilot home differs from mission home.")
+        print("Updating autopilot home...")
+
+        self._set_home_position(
+            lat=expected_home["lat"],
+            lon=expected_home["lon"],
+            alt=expected_home["alt"],
+        )
+
+        # Read HOME_POSITION again to verify the update.
+        updated_home = self._get_home_position()
+
+        if not self._home_matches(
+            expected_home,
+            updated_home,
+            position_tolerance_m,
+            altitude_tolerance_m,
+        ):
+            raise RuntimeError(
+                "Home update was not verified.\n"
+                f"Expected: {expected_home}\n"
+                f"Actual: {updated_home}"
+            )
+
+        print("Autopilot home updated successfully.")
+
+    def _extract_home_from_mission(self, mission_items) -> dict:
+        """
+        Extract latitude, longitude, and altitude from mission item 0.
+
+        Supports both:
+        - MISSION_ITEM_INT: x/y are latitude/longitude * 1e7
+        - MISSION_ITEM: x/y are latitude/longitude in degrees
+        """
+
+        if not mission_items:
+            raise ValueError("Cannot extract home from an empty mission.")
+
+        item = mission_items[0]
+
+        if getattr(item, "seq", 0) != 0:
+            raise ValueError(
+                "The first downloaded mission item is not sequence 0."
+            )
+
+        message_type = item.get_type()
+
+        if message_type == "MISSION_ITEM_INT":
+            lat = item.x / 1e7
+            lon = item.y / 1e7
+
+        elif message_type == "MISSION_ITEM":
+            lat = float(item.x)
+            lon = float(item.y)
+
+        else:
+            raise TypeError(
+                f"Unsupported mission item type: {message_type}"
+            )
+
+        return {
+            "lat": float(lat),
+            "lon": float(lon),
+            "alt": float(item.z),
+        }
+
+    def _get_home_position(self, timeout_s: float = 5.0) -> dict:
+        """
+        Request and return the autopilot HOME_POSITION.
+
+        Returned altitude is metres above mean sea level.
+        """
+
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_GET_HOME_POSITION,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        deadline = time.time() + timeout_s
+
+        while time.time() < deadline:
+            msg = self.master.recv_match(
+                type="HOME_POSITION",
+                blocking=True,
+                timeout=0.5,
+            )
+
+            if msg is None:
+                continue
+
+            return {
+                "lat": msg.latitude / 1e7,
+                "lon": msg.longitude / 1e7,
+                "alt": msg.altitude / 1000.0,
+            }
+
+        raise TimeoutError(
+            "Timed out waiting for HOME_POSITION from autopilot."
+        )
+
+    def _set_home_position(
+        self,
+        lat: float,
+        lon: float,
+        alt: float,
+        timeout_s: float = 5.0,
+    ) -> None:
+        """
+        Set home using MAV_CMD_DO_SET_HOME through COMMAND_INT.
+
+        lat/lon are degrees.
+        alt is absolute altitude above mean sea level in metres.
+        """
+
+        self.master.mav.command_int_send(
+            self.master.target_system,
+            self.master.target_component,
+
+            # MAV_FRAME_GLOBAL
+            mavutil.mavlink.MAV_FRAME_GLOBAL,
+
+            # MAV_CMD_DO_SET_HOME
+            mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+
+            # current and autocontinue; unused for this command
+            0,
+            0,
+
+            # param1 = 0 means use the specified coordinates
+            0,
+
+            # param2, param3, param4; unused
+            0,
+            0,
+            0,
+
+            # Latitude and longitude are degrees * 1e7
+            int(round(lat * 1e7)),
+            int(round(lon * 1e7)),
+
+            # Absolute altitude in metres
+            float(alt),
+        )
+
+        deadline = time.time() + timeout_s
+
+        while time.time() < deadline:
+            ack = self.master.recv_match(
+                type="COMMAND_ACK",
+                blocking=True,
+                timeout=0.5,
+            )
+
+            if ack is None:
+                continue
+
+            if ack.command != mavutil.mavlink.MAV_CMD_DO_SET_HOME:
+                continue
+
+            if ack.result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                raise RuntimeError(
+                    "Autopilot rejected MAV_CMD_DO_SET_HOME. "
+                    f"Result code: {ack.result}"
+                )
+
+            print("MAV_CMD_DO_SET_HOME accepted.")
+            return
+
+        raise TimeoutError(
+            "Timed out waiting for MAV_CMD_DO_SET_HOME acknowledgement."
+        )
+
+    @staticmethod
+    def _home_matches(
+        expected: dict,
+        actual: dict,
+        position_tolerance_m: float,
+        altitude_tolerance_m: float,
+    ) -> bool:
+        """
+        Compare two home positions using metre-based tolerances.
+        """
+
+        # Approximate north/south distance.
+        lat_error_m = abs(expected["lat"] - actual["lat"]) * 111_000.0
+
+        # East/west distance corrected for latitude.
+        lon_error_m = (
+            abs(expected["lon"] - actual["lon"])
+            * 111_000.0
+            * math.cos(math.radians(expected["lat"]))
+        )
+
+        horizontal_error_m = math.sqrt(
+            lat_error_m ** 2 + lon_error_m ** 2
+        )
+
+        altitude_error_m = abs(expected["alt"] - actual["alt"])
+
+        print(
+            f"Home difference: horizontal={horizontal_error_m:.2f} m, "
+            f"altitude={altitude_error_m:.2f} m"
+        )
+
+        return (
+            horizontal_error_m <= position_tolerance_m
+            and altitude_error_m <= altitude_tolerance_m
+        )
 
     def send_takeoff(self, target_alt_m: float, tolerance_m: float = 1.0) -> None:
         msg = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=10.0)
