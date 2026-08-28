@@ -244,6 +244,7 @@ def main() -> None:
     follower.follow(
         subarrays=planned_path.subarrays,
         max_time_s=cfg.execution.guidance_max_time_s,
+        message_rate_hz=5.0, #Frequency
     )
 
     # ---------------------------------------------------------------------
