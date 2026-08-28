@@ -110,7 +110,6 @@ def compute_desired_roll_for_l1_point(
                 tol_pos=float(l1.tol_pos),
                 max_iter=int(l1.max_iter),
             )
-
             if info.get("converged", False):
                 return float(bank), True
 
