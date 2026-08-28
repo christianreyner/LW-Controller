@@ -1,126 +1,219 @@
 #!/usr/bin/env python3
 """
-Wind-aware bank angle solver + example with plotting.
+Wind-aware bank-angle solver with roll dynamics and diagnostic plotting.
 
-This script defines a function `desired_bank_to_point_with_wind(...)` that
-computes a steady bank angle (no roll dynamics) which, in the presence of
-constant wind, makes the aircraft's *ground track* pass as close as possible
-to a target point.
+The primary function is:
+
+    desired_bank_to_point_with_wind_roll(...)
+
+It computes a commanded bank angle that attempts to make the aircraft's
+ground trajectory pass through or close to a target point.
+
+Debugging features:
+- Plot the selected aircraft trajectory.
+- Plot wings-level and bank-limit trajectories for comparison.
+- Mark the target and selected closest-approach point.
+- Plot bank angle, heading, and target distance versus time.
+- Plot signed closest-approach error versus commanded bank.
+- Plot all bisection evaluations.
+- Identify closest approaches that occur at the simulation boundaries.
 
 Conventions:
 - x axis: East [m]
 - y axis: North [m]
 - psi: heading [rad], clockwise from North
-- Wind input: speed V_w [m/s] and "from" direction theta_wa [rad],
-  same convention as psi (i.e., direction FROM which the wind blows).
+- phi: bank angle [rad], positive for a right turn
+- Wind direction is the direction FROM which the wind blows
+- theta_wa uses the same clockwise-from-North convention
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
 from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 # ============================================================
-# 1. Data structure for turn parameters
+# 1. Data structures
 # ============================================================
 
 @dataclass
 class TurnWithWindParams:
     """
-    Parameters describing the initial state and environment for a
-    steady, coordinated, level turn with wind.
+    Parameters for a constant-bank coordinated turn with wind.
     """
-    x0: float       # initial x position [m] (East)
-    y0: float       # initial y position [m] (North)
-    psi0: float     # initial heading [rad], clockwise from North
-    g: float        # gravity [m/s^2]
-    V_TAS: float    # true airspeed [m/s]
-    Vw_x: float     # wind x-component [m/s] (East)
-    Vw_y: float     # wind y-component [m/s] (North)
-      
+
+    x0: float
+    y0: float
+    psi0: float
+    g: float
+    V_TAS: float
+    Vw_x: float
+    Vw_y: float
+
+
 @dataclass
 class TurnWithWindRollParams:
     """
-    Parameters for a coordinated turn with wind and simple roll dynamics.
+    Parameters for a coordinated turn with wind and roll dynamics.
     """
-    x0: float       # initial x position [m] (East)
-    y0: float       # initial y position [m] (North)
-    psi0: float     # initial heading [rad], clockwise from North
-    phi0: float     # initial bank angle [rad]
-    g: float        # gravity [m/s^2]
-    V_TAS: float    # true airspeed [m/s]
-    Vw_x: float     # wind x-component [m/s] (East)
-    Vw_y: float     # wind y-component [m/s] (North)
-    p_max: float    # max roll rate magnitude [rad/s] (for roll-in)
+
+    x0: float
+    y0: float
+    psi0: float
+    phi0: float
+    g: float
+    V_TAS: float
+    Vw_x: float
+    Vw_y: float
+    p_max: float
 
 
 # ============================================================
-# 2. Analytic ground track with wind and constant bank
+# 2. General utility functions
+# ============================================================
+
+def wind_components_from_direction(V_w, theta_wa):
+    """
+    Convert wind speed and wind-from direction to East/North components.
+
+    Parameters
+    ----------
+    V_w : float
+        Wind speed [m/s].
+    theta_wa : float
+        Direction FROM which the wind blows [rad], clockwise from North.
+
+    Returns
+    -------
+    Vw_x, Vw_y : float
+        Wind vector components [m/s], East and North respectively.
+    """
+    Vw_x = V_w * np.sin(theta_wa + np.pi)
+    Vw_y = V_w * np.cos(theta_wa + np.pi)
+    return float(Vw_x), float(Vw_y)
+
+
+def interpolate_trajectory_state(t_query, t, x, y, psi, phi):
+    """
+    Linearly interpolate a trajectory state at a requested time.
+    """
+    t_query = float(np.clip(t_query, t[0], t[-1]))
+
+    return {
+        "t": t_query,
+        "x": float(np.interp(t_query, t, x)),
+        "y": float(np.interp(t_query, t, y)),
+        "psi": float(np.interp(t_query, t, psi)),
+        "phi": float(np.interp(t_query, t, phi)),
+    }
+
+
+def parabolic_minimum_time(t3, f3):
+    """
+    Estimate the minimum of a parabola passing through three samples.
+
+    Parameters
+    ----------
+    t3 : array-like, shape (3,)
+        Three times.
+    f3 : array-like, shape (3,)
+        Function values at the three times.
+
+    Returns
+    -------
+    t_vertex : float or None
+        Estimated minimum time. None means the fit is invalid or concave.
+    """
+    tm1, t0, tp1 = np.asarray(t3, dtype=float)
+    fm1, f0, fp1 = np.asarray(f3, dtype=float)
+
+    denom = (
+        (tm1 - t0)
+        * (tm1 - tp1)
+        * (t0 - tp1)
+    )
+
+    if abs(denom) <= 1e-14:
+        return None
+
+    a = (
+        fm1 * (t0 - tp1)
+        + f0 * (tp1 - tm1)
+        + fp1 * (tm1 - t0)
+    ) / denom
+
+    b = (
+        fm1 * (tp1**2 - t0**2)
+        + f0 * (tm1**2 - tp1**2)
+        + fp1 * (t0**2 - tm1**2)
+    ) / denom
+
+    if a <= 0.0:
+        return None
+
+    t_vertex = -b / (2.0 * a)
+
+    if tm1 <= t_vertex <= tp1:
+        return float(t_vertex)
+
+    return None
+
+
+# ============================================================
+# 3. Analytic constant-bank trajectory
 # ============================================================
 
 def position_with_wind_const_bank(t, phi, p: TurnWithWindParams):
     """
-    Analytic (x(t), y(t)) for a coordinated, level, constant-bank turn
-    at constant TAS, in constant wind.
+    Analytic position for a constant-bank turn in constant wind.
 
-    Model:
-      - Heading dynamics:   dψ/dt = (g / V_TAS) * tan(phi)
-      - Air-relative speed: v_air = V_TAS [sin(ψ), cos(ψ)]
-      - Ground speed:       v_g   = v_air + v_wind
+    Model
+    -----
+        dpsi/dt = (g / V_TAS) * tan(phi)
 
-    Parameters
-    ----------
-    t : float or array-like
-        Time(s) [s] at which to evaluate the position.
-    phi : float
-        Bank angle [rad]; sign >0 for right turn, <0 for left.
-    p : TurnWithWindParams
-        Turn and wind parameters.
-
-    Returns
-    -------
-    x, y : ndarray
-        Positions at time(s) t [m].
+        v_air = V_TAS * [sin(psi), cos(psi)]
+        v_gnd = v_air + v_wind
     """
     t = np.asarray(t, dtype=float)
-    x0, y0, psi0 = p.x0, p.y0, p.psi0
-    g, V = p.g, p.V_TAS
-    Vw_x, Vw_y = p.Vw_x, p.Vw_y
 
-    # Handle "almost zero" bank (straight line) explicitly
+    x0 = p.x0
+    y0 = p.y0
+    psi0 = p.psi0
+    g = p.g
+    V = p.V_TAS
+    Vw_x = p.Vw_x
+    Vw_y = p.Vw_y
+
     if abs(phi) < 1e-9:
-        psi = psi0
-        vx = V * np.sin(psi) + Vw_x
-        vy = V * np.cos(psi) + Vw_y
+        vx = V * np.sin(psi0) + Vw_x
+        vy = V * np.cos(psi0) + Vw_y
+
         x = x0 + vx * t
         y = y0 + vy * t
         return x, y
 
-    k = g / V
-    Omega = k * np.tan(phi)  # signed heading rate [rad/s]
+    Omega = (g / V) * np.tan(phi)
 
-    # If Omega is extremely small, treat as straight to avoid numerical issues
     if abs(Omega) < 1e-9:
-        psi = psi0
-        vx = V * np.sin(psi) + Vw_x
-        vy = V * np.cos(psi) + Vw_y
+        vx = V * np.sin(psi0) + Vw_x
+        vy = V * np.cos(psi0) + Vw_y
+
         x = x0 + vx * t
         y = y0 + vy * t
         return x, y
 
     psi_t = psi0 + Omega * t
 
-    # Analytic integration (air-relative contribution)
-    # ∫ sin(ψ0 + Ω τ) dτ = [-cos(ψ0 + Ω τ)] / Ω
-    # ∫ cos(ψ0 + Ω τ) dτ = [ sin(ψ0 + Ω τ)] / Ω
     x = (
         x0
-        + V * (-(np.cos(psi_t) - np.cos(psi0)) / Omega)
+        - V * (np.cos(psi_t) - np.cos(psi0)) / Omega
         + Vw_x * t
     )
+
     y = (
         y0
-        + V * ((np.sin(psi_t) - np.sin(psi0)) / Omega)
+        + V * (np.sin(psi_t) - np.sin(psi0)) / Omega
         + Vw_y * t
     )
 
@@ -129,116 +222,262 @@ def position_with_wind_const_bank(t, phi, p: TurnWithWindParams):
 
 def heading_at_time(phi, t, p: TurnWithWindParams):
     """
-    Heading ψ(t) for a constant-bank turn.
-
-    Parameters
-    ----------
-    phi : float
-        Bank angle [rad].
-    t : float or array-like
-        Time(s) [s].
-    p : TurnWithWindParams
-        Turn parameters.
-
-    Returns
-    -------
-    psi : float or ndarray
-        Heading(s) [rad], clockwise from North.
+    Heading for a constant-bank turn.
     """
     t = np.asarray(t, dtype=float)
-    if abs(phi) < 1e-9:
-        return np.full_like(t, p.psi0)
 
-    k = p.g / p.V_TAS
-    Omega = k * np.tan(phi)
+    if abs(phi) < 1e-9:
+        return np.full_like(t, p.psi0, dtype=float)
+
+    Omega = (p.g / p.V_TAS) * np.tan(phi)
     return p.psi0 + Omega * t
+
+
+# ============================================================
+# 4. Numerical trajectory with roll dynamics
+# ============================================================
 
 def trajectory_with_wind_roll(
     phi_cmd,
     p: TurnWithWindRollParams,
     t_final,
     dt=0.05,
+    max_turns=1.0,
 ):
     """
-    Vectorized numerical trajectory with wind and simple roll dynamics
-    (roll-in only, no roll-out), using fixed step Euler integration.
+    Simulate the aircraft trajectory with roll dynamics and wind.
 
-    Bank dynamics:
-        dphi/dt = ±p_max until phi reaches phi_cmd, then holds.
+    The trajectory ends when either:
+      1. t_final is reached, or
+      2. max_turns of accumulated heading rotation is reached.
 
-    Heading:
-        dpsi/dt = (g / V_TAS) * tan(phi)
-
-    Position:
-        v_air = V_TAS [sin(psi), cos(psi)]
-        v_g   = v_air + v_wind
-        x,y integrated with Euler, using v_g(t_{k+1}) as in the loop version.
+    Set max_turns=None to disable the turn limiter.
     """
-    # Time grid
-    n_steps = max(2, int(np.ceil(t_final / dt)) + 1)
-    t = dt * np.arange(n_steps)   # [0, dt, 2dt, ...]
-    # Effective dt (constant)
-    dt_eff = dt
+    if t_final <= 0.0:
+        raise ValueError("t_final must be greater than zero.")
 
-    # --------------------------
-    # Bank profile φ(t): ramp with saturation at phi_cmd
-    # --------------------------
+    if dt <= 0.0:
+        raise ValueError("dt must be greater than zero.")
+
+    if p.V_TAS <= 0.0:
+        raise ValueError("V_TAS must be greater than zero.")
+
+    # Full time grid up to t_final.
+    n_intervals = max(1, int(np.ceil(t_final / dt)))
+    t = np.linspace(0.0, t_final, n_intervals + 1)
+    dt_steps = np.diff(t)
+
+    n = len(t)
+
+    # --------------------------------------------------------
+    # Bank profile
+    # --------------------------------------------------------
     dphi_total = phi_cmd - p.phi0
-    phi = np.empty(n_steps)
 
     if abs(dphi_total) < 1e-12 or p.p_max <= 0.0:
-        # No roll or no roll authority: constant bank
-        phi[:] = p.phi0
+        phi = np.full(n, p.phi0, dtype=float)
     else:
-        sgn = np.sign(dphi_total)
-        # Ideal ramp
-        phi_ramp = p.phi0 + sgn * p.p_max * t
-        # Saturate at phi_cmd
-        if sgn > 0:
+        roll_direction = np.sign(dphi_total)
+        phi_ramp = p.phi0 + roll_direction * p.p_max * t
+
+        if roll_direction > 0.0:
             phi = np.minimum(phi_ramp, phi_cmd)
         else:
             phi = np.maximum(phi_ramp, phi_cmd)
 
-    # --------------------------
-    # Heading ψ(t)
-    # --------------------------
-    psi = np.empty(n_steps)
+    # --------------------------------------------------------
+    # Heading
+    # --------------------------------------------------------
+    psi = np.empty(n, dtype=float)
     psi[0] = p.psi0
 
-    g_over_V = p.g / p.V_TAS
-
-    # Use φ at t_{k+1} like in the loop version: ψ_{k+1} depends on φ_{k+1}
     phi_for_psi = phi[1:].copy()
-    # Optional threshold to mimic your if |phi| < 1e-9: psi_dot = 0
     phi_for_psi[np.abs(phi_for_psi) < 1e-9] = 0.0
 
-    psi_dot = g_over_V * np.tan(phi_for_psi)    # size n_steps-1
-    psi[1:] = p.psi0 + np.cumsum(psi_dot * dt_eff)
+    psi_dot = (p.g / p.V_TAS) * np.tan(phi_for_psi)
+    delta_psi = psi_dot * dt_steps
 
-    # --------------------------
-    # Velocities and positions
-    # --------------------------
-    V = p.V_TAS
-    vx_air = V * np.sin(psi)
-    vy_air = V * np.cos(psi)
+    psi[1:] = p.psi0 + np.cumsum(delta_psi)
 
-    vx_g = vx_air + p.Vw_x
-    vy_g = vy_air + p.Vw_y
+    # --------------------------------------------------------
+    # Stop after max_turns of accumulated heading rotation
+    # --------------------------------------------------------
+    if max_turns is not None and max_turns > 0.0:
+        accumulated_turn = np.concatenate(
+            ([0.0], np.cumsum(np.abs(delta_psi)))
+        )
 
-    x = np.empty(n_steps)
-    y = np.empty(n_steps)
+        maximum_rotation = max_turns * 2.0 * np.pi
+
+        reached = np.nonzero(
+            accumulated_turn >= maximum_rotation
+        )[0]
+
+        if reached.size > 0:
+            stop_index = int(reached[0])
+
+            # Keep the sample where the turn limit was reached.
+            t = t[:stop_index + 1]
+            phi = phi[:stop_index + 1]
+            psi = psi[:stop_index + 1]
+            dt_steps = np.diff(t)
+            n = len(t)
+
+    # --------------------------------------------------------
+    # Ground velocity
+    # --------------------------------------------------------
+    vx_air = p.V_TAS * np.sin(psi)
+    vy_air = p.V_TAS * np.cos(psi)
+
+    vx_ground = vx_air + p.Vw_x
+    vy_ground = vy_air + p.Vw_y
+
+    # --------------------------------------------------------
+    # Position
+    # --------------------------------------------------------
+    x = np.empty(n, dtype=float)
+    y = np.empty(n, dtype=float)
+
     x[0] = p.x0
     y[0] = p.y0
 
-    # Euler: x_{k+1} = x_k + v_g(t_{k+1}) * dt
-    x[1:] = p.x0 + np.cumsum(vx_g[1:] * dt_eff)
-    y[1:] = p.y0 + np.cumsum(vy_g[1:] * dt_eff)
+    if n > 1:
+        x[1:] = p.x0 + np.cumsum(
+            vx_ground[1:] * dt_steps
+        )
+        y[1:] = p.y0 + np.cumsum(
+            vy_ground[1:] * dt_steps
+        )
 
     return t, x, y, psi, phi
 
+
 # ============================================================
-# 3. Closest-approach error for a given bank
+# 5. Closest-approach analysis
 # ============================================================
+
+def analyze_closest_approach_from_trajectory(
+    t,
+    x,
+    y,
+    psi,
+    phi,
+    p: TurnWithWindRollParams,
+    xt,
+    yt,
+):
+    """
+    Analyze the earliest local closest approach in a stored trajectory.
+
+    The function first identifies local minima in squared distance. If no
+    local minimum exists, it uses the global discrete minimum.
+
+    A parabolic fit is used to refine the closest-approach time when the
+    selected point is an interior sample.
+
+    Returns a dictionary containing:
+    - signed cross-track error
+    - closest distance
+    - closest-approach time
+    - interpolated state
+    - all local-minimum indices
+    - whether the minimum is at a simulation boundary
+    """
+    t = np.asarray(t, dtype=float)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    psi = np.asarray(psi, dtype=float)
+    phi = np.asarray(phi, dtype=float)
+
+    dx = x - xt
+    dy = y - yt
+    d2 = dx**2 + dy**2
+    distance = np.sqrt(d2)
+
+    n = len(t)
+
+    if n >= 3:
+        is_local_minimum = (
+            (d2[1:-1] <= d2[:-2])
+            & (d2[1:-1] <= d2[2:])
+        )
+        local_min_indices = np.nonzero(is_local_minimum)[0] + 1
+    else:
+        local_min_indices = np.array([], dtype=int)
+
+    used_global_fallback = local_min_indices.size == 0
+
+    if used_global_fallback:
+        i_min = int(np.argmin(d2))
+    else:
+        # Preserve the original behavior: use the earliest local minimum.
+        i_min = int(local_min_indices[0])
+
+    t_min = float(t[i_min])
+
+    if 0 < i_min < n - 1:
+        refined_time = parabolic_minimum_time(
+            t[i_min - 1:i_min + 2],
+            d2[i_min - 1:i_min + 2],
+        )
+
+        if refined_time is not None:
+            t_min = refined_time
+
+    state = interpolate_trajectory_state(
+        t_min,
+        t,
+        x,
+        y,
+        psi,
+        phi,
+    )
+
+    rx = xt - state["x"]
+    ry = yt - state["y"]
+
+    d_min = float(np.hypot(rx, ry))
+
+    vx = p.V_TAS * np.sin(state["psi"]) + p.Vw_x
+    vy = p.V_TAS * np.cos(state["psi"]) + p.Vw_y
+
+    cross_z = vx * ry - vy * rx
+
+    if d_min <= 1e-12:
+        err = 0.0
+    else:
+        err = float(np.sign(cross_z) * d_min)
+
+    time_epsilon = max(1e-9, 0.51 * np.min(np.diff(t)))
+
+    at_start = t_min <= t[0] + time_epsilon
+    at_end = t_min >= t[-1] - time_epsilon
+
+    if at_start:
+        minimum_location = "start_boundary"
+    elif at_end:
+        minimum_location = "end_boundary"
+    else:
+        minimum_location = "interior"
+
+    return {
+        "err": err,
+        "t_min": t_min,
+        "d_min": d_min,
+        "state": state,
+        "vx_ground": float(vx),
+        "vy_ground": float(vy),
+        "cross_z": float(cross_z),
+        "distance": distance,
+        "distance_squared": d2,
+        "local_min_indices": local_min_indices,
+        "selected_index": i_min,
+        "used_global_fallback": used_global_fallback,
+        "minimum_location": minimum_location,
+        "at_start": at_start,
+        "at_end": at_end,
+    }
+
 
 def closest_approach_error(
     phi,
@@ -250,130 +489,82 @@ def closest_approach_error(
     max_turns=1.0,
 ):
     """
-    For a given bank φ, compute the signed lateral error at the *earliest*
-    local closest-approach point (within at most `max_turns` revolutions).
-
-    Parameters
-    ----------
-    phi : float
-        Bank angle [rad].
-    p : TurnWithWindParams
-        Turn and wind parameters.
-    xt, yt : float
-        Target coordinates [m].
-    t_max : float, optional
-        Hard upper bound on time horizon [s].
-    n_grid : int, optional
-        Number of grid points for the coarse time search.
-    max_turns : float or None, optional
-        Maximum number of heading revolutions considered.
-        - If None: use full [0, t_max].
-        - If >0: limit to min(t_max, max_turns * 2π/|Ω|).
-
-    Returns
-    -------
-    err : float
-        Signed cross-track error [m] at closest approach.
-        > 0 : target is to the LEFT of velocity vector
-        < 0 : target is to the RIGHT.
-    t_min : float
-        Time of (earliest) closest approach [s].
-    d_min : float
-        Scalar distance [m] at that point.
+    Closest-approach error for an analytic constant-bank trajectory.
     """
-    g, V = p.g, p.V_TAS
+    if n_grid < 2:
+        raise ValueError("n_grid must be at least 2.")
 
-    # Heading rate
     if abs(phi) < 1e-9:
         Omega = 0.0
     else:
-        Omega = (g / V) * np.tan(phi)
+        Omega = (p.g / p.V_TAS) * np.tan(phi)
 
-    # Adaptive time horizon: at most `max_turns` heading revolutions
-    if max_turns is not None and max_turns > 0.0 and abs(Omega) > 1e-6:
-        T_one_turn = 2.0 * np.pi / abs(Omega)
-        t_end = min(t_max, max_turns * T_one_turn)
+    if (
+        max_turns is not None
+        and max_turns > 0.0
+        and abs(Omega) > 1e-6
+    ):
+        one_turn_time = 2.0 * np.pi / abs(Omega)
+        t_end = min(t_max, max_turns * one_turn_time)
     else:
         t_end = t_max
 
-    # Coarse grid in time
     t_grid = np.linspace(0.0, t_end, n_grid)
-    xg, yg = position_with_wind_const_bank(t_grid, phi, p)
-    dx = xg - xt
-    dy = yg - yt
+
+    x, y = position_with_wind_const_bank(t_grid, phi, p)
+
+    dx = x - xt
+    dy = y - yt
     d2 = dx**2 + dy**2
 
-    # Find indices of all *local* minima in d^2
-    # d2[i] <= d2[i-1] and d2[i] <= d2[i+1]
     if n_grid >= 3:
-        is_min = (d2[1:-1] <= d2[:-2]) & (d2[1:-1] <= d2[2:])
-        idx_candidates = np.nonzero(is_min)[0] + 1
+        is_local_minimum = (
+            (d2[1:-1] <= d2[:-2])
+            & (d2[1:-1] <= d2[2:])
+        )
+        candidates = np.nonzero(is_local_minimum)[0] + 1
     else:
-        idx_candidates = np.array([], dtype=int)
+        candidates = np.array([], dtype=int)
 
-    if idx_candidates.size == 0:
-        # Fallback: no local minima detected, use global discrete min
+    if candidates.size == 0:
         i_min = int(np.argmin(d2))
     else:
-        # Choose the earliest local minimum in time
-        i_min = int(idx_candidates[0])
+        i_min = int(candidates[0])
 
-    # Parabolic refinement around selected minimum (if interior)
+    t_min = float(t_grid[i_min])
+
     if 0 < i_min < n_grid - 1:
-        tm1, t0, tp1 = t_grid[i_min - 1 : i_min + 2]
-        d2m1, d20, d2p1 = d2[i_min - 1 : i_min + 2]
+        refined_time = parabolic_minimum_time(
+            t_grid[i_min - 1:i_min + 2],
+            d2[i_min - 1:i_min + 2],
+        )
 
-        denom = (tm1 - t0) * (tm1 - tp1) * (t0 - tp1)
-        if abs(denom) > 1e-14:
-            a = (
-                d2m1 * (t0 - tp1)
-                + d20 * (tp1 - tm1)
-                + d2p1 * (tm1 - t0)
-            ) / denom
+        if refined_time is not None:
+            t_min = refined_time
 
-            b = (
-                d2m1 * (tp1**2 - t0**2)
-                + d20 * (tm1**2 - tp1**2)
-                + d2p1 * (t0**2 - tm1**2)
-            ) / denom
-
-            if a > 0:
-                t_vertex = -b / (2 * a)
-                if tm1 <= t_vertex <= tp1:
-                    t_min = float(t_vertex)
-                else:
-                    t_min = float(t0)
-            else:
-                t_min = float(t0)
-        else:
-            t_min = float(t0)
-    else:
-        t_min = float(t_grid[i_min])
-
-    # Evaluate position and distance at refined t_min
     x_min, y_min = position_with_wind_const_bank(t_min, phi, p)
-    dx = x_min - xt
-    dy = y_min - yt
-    d_min = float(np.hypot(dx, dy))
 
-    # Ground velocity at t_min
-    if abs(phi) < 1e-9:
-        psi = p.psi0
-    else:
-        psi = p.psi0 + Omega * t_min
+    x_min = float(np.asarray(x_min))
+    y_min = float(np.asarray(y_min))
 
-    vx = V * np.sin(psi) + p.Vw_x
-    vy = V * np.cos(psi) + p.Vw_y
-
-    # Vector from aircraft to target
     rx = xt - x_min
     ry = yt - y_min
+    d_min = float(np.hypot(rx, ry))
 
-    # 2D cross product v × r (z-component)
+    psi_min = float(heading_at_time(phi, t_min, p))
+
+    vx = p.V_TAS * np.sin(psi_min) + p.Vw_x
+    vy = p.V_TAS * np.cos(psi_min) + p.Vw_y
+
     cross_z = vx * ry - vy * rx
 
-    err = float(np.sign(cross_z) * d_min)
-    return err, float(t_min), d_min
+    if d_min <= 1e-12:
+        err = 0.0
+    else:
+        err = float(np.sign(cross_z) * d_min)
+
+    return err, t_min, d_min
+
 
 def closest_approach_error_with_roll(
     phi_cmd,
@@ -382,114 +573,64 @@ def closest_approach_error_with_roll(
     yt,
     t_max=200.0,
     dt=0.05,
+    max_turns=1.0,
+    return_details=False,
 ):
-    """
-    Compute signed cross-track error at earliest local closest-approach point
-    for a given commanded bank phi_cmd, using roll dynamics.
+    t, x, y, psi, phi = trajectory_with_wind_roll(
+        phi_cmd=phi_cmd,
+        p=p,
+        t_final=t_max,
+        dt=dt,
+        max_turns=max_turns,
+    )
 
-    Parameters
-    ----------
-    phi_cmd : float
-        Commanded steady bank [rad] after roll-in.
-    p : TurnWithWindRollParams
-        Turn and wind parameters including initial bank & roll-rate limit.
-    xt, yt : float
-        Target coordinates [m].
-    t_max : float, optional
-        End of simulation horizon [s].
-    dt : float, optional
-        Integration step [s].
+    closest = analyze_closest_approach_from_trajectory(
+        t=t,
+        x=x,
+        y=y,
+        psi=psi,
+        phi=phi,
+        p=p,
+        xt=xt,
+        yt=yt,
+    )
 
-    Returns
-    -------
-    err : float
-        Signed cross-track error [m] at closest approach.
-    t_min : float
-        Time of earliest closest approach [s].
-    d_min : float
-        Minimum distance [m].
-    """
-    # Simulate trajectory with roll-in
-    t, x, y, psi, phi = trajectory_with_wind_roll(phi_cmd, p, t_final=t_max, dt=dt)
+    if return_details:
+        details = {
+            "phi_cmd": float(phi_cmd),
+            "t": t,
+            "x": x,
+            "y": y,
+            "psi": psi,
+            "phi": phi,
+            "closest": closest,
+            "turns_completed": float(
+                np.sum(np.abs(np.diff(psi))) / (2.0 * np.pi)
+            ),
+            "stopped_by_turn_limit": bool(
+                max_turns is not None
+                and max_turns > 0.0
+                and np.sum(np.abs(np.diff(psi)))
+                    >= max_turns * 2.0 * np.pi - 1e-6
+            ),
+        }
 
-    # Distances to target
-    dx = x - xt
-    dy = y - yt
-    d2 = dx**2 + dy**2
+        return (
+            closest["err"],
+            closest["t_min"],
+            closest["d_min"],
+            details,
+        )
 
-    n = len(t)
-    if n < 3:
-        i_min = int(np.argmin(d2))
-        t_min = float(t[i_min])
-        d_min = float(np.sqrt(d2[i_min]))
-    else:
-        # local minima indices
-        is_min = (d2[1:-1] <= d2[:-2]) & (d2[1:-1] <= d2[2:])
-        idx_candidates = np.nonzero(is_min)[0] + 1
+    return (
+        closest["err"],
+        closest["t_min"],
+        closest["d_min"],
+    )
 
-        if idx_candidates.size == 0:
-            i_min = int(np.argmin(d2))
-            t_min = float(t[i_min])
-        else:
-            i_min = int(idx_candidates[0])   # earliest local minimum
-
-            # Optional parabolic refinement
-            tm1, t0, tp1 = t[i_min - 1 : i_min + 2]
-            d2m1, d20, d2p1 = d2[i_min - 1 : i_min + 2]
-            denom = (tm1 - t0) * (tm1 - tp1) * (t0 - tp1)
-            if abs(denom) > 1e-14:
-                a = (
-                    d2m1 * (t0 - tp1)
-                    + d20 * (tp1 - tm1)
-                    + d2p1 * (tm1 - t0)
-                ) / denom
-
-                b = (
-                    d2m1 * (tp1**2 - t0**2)
-                    + d20 * (tm1**2 - tp1**2)
-                    + d2p1 * (t0**2 - tm1**2)
-                ) / denom
-
-                if a > 0:
-                    t_vertex = -b / (2 * a)
-                    if tm1 <= t_vertex <= tp1:
-                        t_min = float(t_vertex)
-                    else:
-                        t_min = float(t0)
-                else:
-                    t_min = float(t0)
-            else:
-                t_min = float(t0)
-
-        # recompute distance at refined time
-        # small one-step interpolation: find closest index, no need re-simulate
-        i_closest = int(np.argmin(np.abs(t - t_min)))
-        d_min = float(np.sqrt(d2[i_closest]))
-
-    # Ground velocity at t_min (interpolated from stored psi, phi)
-    i_closest = int(np.argmin(np.abs(t - t_min)))
-    psi_t = psi[i_closest]
-
-    V = p.V_TAS
-    vx = V * np.sin(psi_t) + p.Vw_x
-    vy = V * np.cos(psi_t) + p.Vw_y
-
-    # Position at t_min
-    x_t = x[i_closest]
-    y_t = y[i_closest]
-
-    # Vector from aircraft to target
-    rx = xt - x_t
-    ry = yt - y_t
-
-    # Cross product z component: v × r
-    cross_z = vx * ry - vy * rx
-    err = float(np.sign(cross_z) * d_min)
-
-    return err, float(t_min), d_min
 
 # ============================================================
-# 4. Bank angle solver with wind
+# 6. Constant-bank solver
 # ============================================================
 
 def desired_bank_to_point_with_wind(
@@ -508,149 +649,158 @@ def desired_bank_to_point_with_wind(
     max_iter=40,
 ):
     """
-    Compute steady bank angle φ (no roll dynamics) that, in constant wind,
-    makes the aircraft's ground track pass as close as possible to (xt, yt).
-
-    Error function:
-      - For each φ, find time of closest approach to target (over [0, t_max]).
-      - Return signed cross-track error at that point.
-    Then use a bracketed 1D root-finder (bisection) on φ.
-
-    Parameters
-    ----------
-    x0, y0 : float
-        Initial position [m].
-    psi0 : float
-        Initial heading [rad], clockwise from North.
-    xt, yt : float
-        Target coordinates [m].
-    g : float
-        Gravity [m/s^2].
-    V_TAS : float
-        True airspeed [m/s].
-    V_w : float
-        Wind speed [m/s].
-    theta_wa : float
-        Wind-from direction [rad], clockwise from North.
-        (E.g. 270° means wind from West, blowing East.)
-    t_max : float, optional
-        Time horizon [s] for closest-approach search.
-    phi_max : float, optional
-        Maximum absolute bank angle [rad] used as a search bound.
-    tol_pos : float, optional
-        Acceptable lateral error [m] for convergence.
-    max_iter : int, optional
-        Maximum number of bisection iterations.
-
-    Returns
-    -------
-    phi_cmd : float
-        Desired bank angle [rad]; >0 right turn, <0 left turn.
-    info : dict
-        Diagnostic information:
-        - 'phi_solution': final φ [rad]
-        - 'err': final signed cross-track error [m]
-        - 't_min': time of closest approach [s]
-        - 'd_min': distance at closest approach [m]
-        - 'bracket': final bracket (φ_left, φ_right) [rad]
-        - 'converged': bool
-        - optional 'reason': string if not converged (e.g., 'no_sign_change')
+    Compute a constant bank angle without roll dynamics.
     """
-    # Wind components from "wind from" direction
-    # theta_wa is the direction FROM which the wind blows, so the
-    # actual wind vector points at theta_wa + π.
-    Vw_x = V_w * np.sin(theta_wa + np.pi)
-    Vw_y = V_w * np.cos(theta_wa + np.pi)
+    Vw_x, Vw_y = wind_components_from_direction(V_w, theta_wa)
 
-    # Package parameters
     p = TurnWithWindParams(
         x0=float(x0),
         y0=float(y0),
         psi0=float(psi0),
         g=float(g),
         V_TAS=float(V_TAS),
-        Vw_x=float(Vw_x),
-        Vw_y=float(Vw_y),
+        Vw_x=Vw_x,
+        Vw_y=Vw_y,
     )
 
-    # 1) Check wings-level solution
-    err0, t0_min, d0_min = closest_approach_error(0.0, p, xt, yt, t_max=t_max, max_turns=1.0)
+    history = []
+
+    def evaluate(phi):
+        err, t_min, d_min = closest_approach_error(
+            phi,
+            p,
+            xt,
+            yt,
+            t_max=t_max,
+            max_turns=1.0,
+        )
+
+        history.append({
+            "phi": float(phi),
+            "err": float(err),
+            "t_min": float(t_min),
+            "d_min": float(d_min),
+        })
+
+        return err, t_min, d_min
+
+    err0, t0, d0 = evaluate(0.0)
+
     if abs(err0) <= tol_pos:
-        info = dict(
-            phi_solution=0.0,
-            err=err0,
-            t_min=t0_min,
-            d_min=d0_min,
-            bracket=(0.0, 0.0),
-            converged=True,
-            note="wings_level_sufficient",
-        )
-        return 0.0, info
+        return 0.0, {
+            "phi_solution": 0.0,
+            "err": err0,
+            "t_min": t0,
+            "d_min": d0,
+            "bracket": (0.0, 0.0),
+            "converged": True,
+            "note": "wings_level_sufficient",
+            "history": history,
+        }
 
-    # 2) Set up search bracket for bank angle
-    phi_L = -phi_max
-    phi_R = +phi_max
+    phi_left = -abs(phi_max)
+    phi_right = abs(phi_max)
 
-    err_L, tL, dL = closest_approach_error(phi_L, p, xt, yt, t_max=t_max, max_turns=1.0)
-    err_R, tR, dR = closest_approach_error(phi_R, p, xt, yt, t_max=t_max, max_turns=1.0)
+    err_left, t_left, d_left = evaluate(phi_left)
+    err_right, t_right, d_right = evaluate(phi_right)
 
-    # 3) Check if error changes sign in [phi_L, phi_R]
-    if err_L * err_R > 0:
-        # No sign change: within the allowed bank range, the target
-        # is always on same side of the track. Choose best of ends.
-        if abs(err_L) < abs(err_R):
-            phi_sol = phi_L
-            err_sol, t_sol, d_sol = err_L, tL, dL
+    if abs(err_left) <= tol_pos:
+        return phi_left, {
+            "phi_solution": phi_left,
+            "err": err_left,
+            "t_min": t_left,
+            "d_min": d_left,
+            "bracket": (phi_left, phi_left),
+            "converged": True,
+            "note": "left_boundary_solution",
+            "history": history,
+        }
+
+    if abs(err_right) <= tol_pos:
+        return phi_right, {
+            "phi_solution": phi_right,
+            "err": err_right,
+            "t_min": t_right,
+            "d_min": d_right,
+            "bracket": (phi_right, phi_right),
+            "converged": True,
+            "note": "right_boundary_solution",
+            "history": history,
+        }
+
+    if err_left * err_right > 0.0:
+        if abs(err_left) <= abs(err_right):
+            phi_solution = phi_left
+            err_solution = err_left
+            t_solution = t_left
+            d_solution = d_left
         else:
-            phi_sol = phi_R
-            err_sol, t_sol, d_sol = err_R, tR, dR
+            phi_solution = phi_right
+            err_solution = err_right
+            t_solution = t_right
+            d_solution = d_right
 
-        info = dict(
-            phi_solution=phi_sol,
-            err=err_sol,
-            t_min=t_sol,
-            d_min=d_sol,
-            bracket=(phi_L, phi_R),
-            converged=False,
-            reason="no_sign_change",
-        )
-        return phi_sol, info
+        return phi_solution, {
+            "phi_solution": phi_solution,
+            "err": err_solution,
+            "t_min": t_solution,
+            "d_min": d_solution,
+            "bracket": (phi_left, phi_right),
+            "converged": False,
+            "reason": "no_sign_change",
+            "history": history,
+        }
 
-    # 4) Bisection within [phi_L, phi_R]
-    a, b = phi_L, phi_R
-    fa, fb = err_L, err_R
+    a = phi_left
+    b = phi_right
+    fa = err_left
+    fb = err_right
 
-    phi_sol = None
-    err_sol = None
-    t_sol = None
-    d_sol = None
+    phi_solution = 0.5 * (a + b)
+    err_solution = np.nan
+    t_solution = np.nan
+    d_solution = np.nan
     converged = False
 
     for _ in range(max_iter):
         c = 0.5 * (a + b)
-        fc, tc, dc = closest_approach_error(c, p, xt, yt, t_max=t_max, max_turns=1.0)
+        fc, tc, dc = evaluate(c)
 
-        phi_sol, err_sol, t_sol, d_sol = c, fc, tc, dc
+        phi_solution = c
+        err_solution = fc
+        t_solution = tc
+        d_solution = dc
 
         if abs(fc) <= tol_pos:
             converged = True
             break
 
-        # Maintain sign change in the bracket
-        if fa * fc < 0:
-            b, fb = c, fc
+        if fa * fc < 0.0:
+            b = c
+            fb = fc
         else:
-            a, fa = c, fc
+            a = c
+            fa = fc
 
-    info = dict(
-        phi_solution=phi_sol,
-        err=err_sol,
-        t_min=t_sol,
-        d_min=d_sol,
-        bracket=(a, b),
-        converged=converged,
-    )
-    return phi_sol, info
+    info = {
+        "phi_solution": phi_solution,
+        "err": err_solution,
+        "t_min": t_solution,
+        "d_min": d_solution,
+        "bracket": (a, b),
+        "converged": converged,
+        "history": history,
+    }
+
+    if not converged:
+        info["reason"] = "max_iterations"
+
+    return phi_solution, info
+
+
+# ============================================================
+# 7. Roll-aware solver
+# ============================================================
 
 def desired_bank_to_point_with_wind_roll(
     x0,
@@ -663,57 +813,66 @@ def desired_bank_to_point_with_wind_roll(
     V_TAS,
     V_w,
     theta_wa,
-    p_max_roll=np.deg2rad(15.0),   # e.g. 15 deg/s
+    p_max_roll=np.deg2rad(15.0),
     t_max=200.0,
     dt=0.05,
     phi_max=np.deg2rad(60.0),
     tol_pos=1.0,
     max_iter=40,
+    debug_plot=False,
+    plot_on_failure=False,
+    plot_scan_points=121,
+    plot_filename=None,
+    show_plot=True,
 ):
     """
-    Compute commanded steady bank phi_cmd that, with roll dynamics (no roll-out)
-    and constant wind, makes the ground track pass as close as possible to (xt, yt).
-
-    Bank dynamics:
-      - Start from phi0 at t=0.
-      - Roll with ±p_max_roll until phi reaches phi_cmd.
-      - Then hold phi = phi_cmd (no roll-out).
+    Compute commanded bank with roll dynamics and constant wind.
 
     Parameters
     ----------
-    x0, y0, psi0, phi0 : float
-        Initial position [m], heading [rad], and bank [rad].
-    xt, yt : float
-        Target coordinates [m].
-    g, V_TAS : float
-        Gravity [m/s^2], true airspeed [m/s].
-    V_w : float
-        Wind speed [m/s].
-    theta_wa : float
-        Wind-from direction [rad], clockwise from North.
-    p_max_roll : float, optional
-        Max roll rate magnitude [rad/s].
-    t_max : float, optional
-        Time horizon [s].
-    dt : float, optional
-        Integration time step [s].
-    phi_max : float, optional
-        Max |phi_cmd| considered [rad].
-    tol_pos : float, optional
-        Lateral error tolerance [m].
-    max_iter : int, optional
-        Bisection iterations.
+    debug_plot : bool
+        If True, always generate a diagnostic plot.
+
+    plot_on_failure : bool
+        If True, generate a diagnostic plot when the solver does not
+        converge.
+
+    plot_scan_points : int
+        Number of bank commands evaluated in the diagnostic error scan.
+
+    plot_filename : str or None
+        If provided, save the diagnostic figure to this file.
+
+    show_plot : bool
+        If True, call plt.show() after generating the figure.
 
     Returns
     -------
     phi_cmd : float
-        Commanded bank angle [rad].
+        Selected commanded bank [rad].
+
     info : dict
-        Diagnostics, analogous to the constant-bank version.
+        Solver and trajectory diagnostics. The selected trajectory is
+        available under:
+
+            info["trajectory"]
     """
-    # Wind components
-    Vw_x = V_w * np.sin(theta_wa + np.pi)
-    Vw_y = V_w * np.cos(theta_wa + np.pi)
+    if V_TAS <= 0.0:
+        raise ValueError("V_TAS must be greater than zero.")
+
+    if g <= 0.0:
+        raise ValueError("g must be greater than zero.")
+
+    if t_max <= 0.0:
+        raise ValueError("t_max must be greater than zero.")
+
+    if dt <= 0.0:
+        raise ValueError("dt must be greater than zero.")
+
+    if phi_max <= 0.0:
+        raise ValueError("phi_max must be greater than zero.")
+
+    Vw_x, Vw_y = wind_components_from_direction(V_w, theta_wa)
 
     p = TurnWithWindRollParams(
         x0=float(x0),
@@ -724,213 +883,911 @@ def desired_bank_to_point_with_wind_roll(
         V_TAS=float(V_TAS),
         Vw_x=float(Vw_x),
         Vw_y=float(Vw_y),
-        p_max=float(p_max_roll),
+        p_max=float(abs(p_max_roll)),
     )
 
-    # 1) Check wings-level command: phi_cmd = 0
-    err0, t0_min, d0_min = closest_approach_error_with_roll(
-        0.0, p, xt, yt, t_max=t_max, dt=dt
-    )
+    history = []
+
+    def evaluate(phi_cmd):
+        err, t_min, d_min, details = closest_approach_error_with_roll(
+            phi_cmd=phi_cmd,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            return_details=True,
+        )
+
+        closest = details["closest"]
+
+        history.append({
+            "phi": float(phi_cmd),
+            "err": float(err),
+            "t_min": float(t_min),
+            "d_min": float(d_min),
+            "minimum_location": closest["minimum_location"],
+            "used_global_fallback": closest["used_global_fallback"],
+        })
+
+        return err, t_min, d_min
+
+    # --------------------------------------------------------
+    # 1. Wings-level command
+    # --------------------------------------------------------
+    err0, t0, d0 = evaluate(0.0)
+
     if abs(err0) <= tol_pos:
-        info = dict(
-            phi_solution=0.0,
-            err=err0,
-            t_min=t0_min,
-            d_min=d0_min,
-            bracket=(0.0, 0.0),
-            converged=True,
-            note="wings_level_sufficient",
+        phi_solution = 0.0
+
+        info = {
+            "phi_solution": phi_solution,
+            "err": err0,
+            "t_min": t0,
+            "d_min": d0,
+            "bracket": (0.0, 0.0),
+            "converged": True,
+            "note": "wings_level_sufficient",
+            "history": history,
+        }
+
+        return _finalize_roll_solution(
+            phi_solution=phi_solution,
+            info=info,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            phi_max=phi_max,
+            tol_pos=tol_pos,
+            debug_plot=debug_plot,
+            plot_on_failure=plot_on_failure,
+            plot_scan_points=plot_scan_points,
+            plot_filename=plot_filename,
+            show_plot=show_plot,
         )
-        return 0.0, info
 
-    # 2) Bracket
-    phi_L = -phi_max
-    phi_R = +phi_max
+    # --------------------------------------------------------
+    # 2. Evaluate bank limits
+    # --------------------------------------------------------
+    phi_left = -abs(phi_max)
+    phi_right = abs(phi_max)
 
-    err_L, tL, dL = closest_approach_error_with_roll(
-        phi_L, p, xt, yt, t_max=t_max, dt=dt
-    )
-    err_R, tR, dR = closest_approach_error_with_roll(
-        phi_R, p, xt, yt, t_max=t_max, dt=dt
-    )
+    err_left, t_left, d_left = evaluate(phi_left)
+    err_right, t_right, d_right = evaluate(phi_right)
 
-    if err_L * err_R > 0:
-        # No sign change: pick end with smaller |err|
-        if abs(err_L) < abs(err_R):
-            phi_sol, err_sol, t_sol, d_sol = phi_L, err_L, tL, dL
+    if abs(err_left) <= tol_pos:
+        info = {
+            "phi_solution": phi_left,
+            "err": err_left,
+            "t_min": t_left,
+            "d_min": d_left,
+            "bracket": (phi_left, phi_left),
+            "converged": True,
+            "note": "left_boundary_solution",
+            "history": history,
+        }
+
+        return _finalize_roll_solution(
+            phi_solution=phi_left,
+            info=info,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            phi_max=phi_max,
+            tol_pos=tol_pos,
+            debug_plot=debug_plot,
+            plot_on_failure=plot_on_failure,
+            plot_scan_points=plot_scan_points,
+            plot_filename=plot_filename,
+            show_plot=show_plot,
+        )
+
+    if abs(err_right) <= tol_pos:
+        info = {
+            "phi_solution": phi_right,
+            "err": err_right,
+            "t_min": t_right,
+            "d_min": d_right,
+            "bracket": (phi_right, phi_right),
+            "converged": True,
+            "note": "right_boundary_solution",
+            "history": history,
+        }
+
+        return _finalize_roll_solution(
+            phi_solution=phi_right,
+            info=info,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            phi_max=phi_max,
+            tol_pos=tol_pos,
+            debug_plot=debug_plot,
+            plot_on_failure=plot_on_failure,
+            plot_scan_points=plot_scan_points,
+            plot_filename=plot_filename,
+            show_plot=show_plot,
+        )
+
+    # --------------------------------------------------------
+    # 3. Check initial bracket
+    # --------------------------------------------------------
+    if err_left * err_right > 0.0:
+        if abs(err_left) <= abs(err_right):
+            phi_solution = phi_left
+            err_solution = err_left
+            t_solution = t_left
+            d_solution = d_left
         else:
-            phi_sol, err_sol, t_sol, d_sol = phi_R, err_R, tR, dR
+            phi_solution = phi_right
+            err_solution = err_right
+            t_solution = t_right
+            d_solution = d_right
 
-        info = dict(
-            phi_solution=phi_sol,
-            err=err_sol,
-            t_min=t_sol,
-            d_min=d_sol,
-            bracket=(phi_L, phi_R),
-            converged=False,
-            reason="no_sign_change",
+        info = {
+            "phi_solution": phi_solution,
+            "err": err_solution,
+            "t_min": t_solution,
+            "d_min": d_solution,
+            "bracket": (phi_left, phi_right),
+            "converged": False,
+            "reason": "suboptimal",
+            "history": history,
+        }
+
+        return _finalize_roll_solution(
+            phi_solution=phi_solution,
+            info=info,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            phi_max=phi_max,
+            tol_pos=tol_pos,
+            debug_plot=debug_plot,
+            plot_on_failure=plot_on_failure,
+            plot_scan_points=plot_scan_points,
+            plot_filename=plot_filename,
+            show_plot=show_plot,
         )
-        return phi_sol, info
 
-    # 3) Bisection
-    a, b = phi_L, phi_R
-    fa, fb = err_L, err_R
+    # --------------------------------------------------------
+    # 4. Bisection
+    # --------------------------------------------------------
+    a = phi_left
+    b = phi_right
+    fa = err_left
+    fb = err_right
 
-    phi_sol = None
-    err_sol = None
-    t_sol = None
-    d_sol = None
+    phi_solution = 0.5 * (a + b)
+    err_solution = np.nan
+    t_solution = np.nan
+    d_solution = np.nan
     converged = False
 
     for _ in range(max_iter):
         c = 0.5 * (a + b)
-        fc, tc, dc = closest_approach_error_with_roll(
-            c, p, xt, yt, t_max=t_max, dt=dt
-        )
+        fc, tc, dc = evaluate(c)
 
-        phi_sol, err_sol, t_sol, d_sol = c, fc, tc, dc
+        phi_solution = c
+        err_solution = fc
+        t_solution = tc
+        d_solution = dc
 
         if abs(fc) <= tol_pos:
             converged = True
             break
 
-        if fa * fc < 0:
-            b, fb = c, fc
+        if fa * fc < 0.0:
+            b = c
+            fb = fc
         else:
-            a, fa = c, fc
+            a = c
+            fa = fc
 
-    info = dict(
-        phi_solution=phi_sol,
-        err=err_sol,
-        t_min=t_sol,
-        d_min=d_sol,
-        bracket=(a, b),
-        converged=converged,
-    )
-    return phi_sol, info
+    info = {
+        "phi_solution": phi_solution,
+        "err": err_solution,
+        "t_min": t_solution,
+        "d_min": d_solution,
+        "bracket": (a, b),
+        "converged": converged,
+        "history": history,
+    }
 
-# ============================================================
-# 5. Example + plotting (stops at target hit / closest approach)
-# ============================================================
+    if not converged:
+        info["reason"] = "max_iterations"
 
-def run_example(constants, start, end, psi0):
-    # -------------------------
-    # Scenario setup
-    # -------------------------
-    g, V_TAS, bank_angle, V_w, theta_wa, dt = constants
-
-    # Initial state
-    x0, y0 = start
-
-    # Target position [m]
-    xt, yt = end
-
-    # Solver parameters
-    t_search = 300.0       # [s] search horizon for closest approach
-    phi_max = np.deg2rad(89.0)     # max bank for search
-    tol_pos = 0.5         # [m] lateral error tolerance ("hit" radius)
-
-    # -------------------------
-    # Solve for wind-aware bank
-    # -------------------------
-    phi_sol, info = desired_bank_to_point_with_wind(
-        x0=x0,
-        y0=y0,
-        psi0=psi0,
+    return _finalize_roll_solution(
+        phi_solution=phi_solution,
+        info=info,
+        p=p,
         xt=xt,
         yt=yt,
-        g=g,
-        V_TAS=V_TAS,
-        V_w=V_w,
-        theta_wa=theta_wa,
-        t_max=t_search,
+        t_max=t_max,
+        dt=dt,
         phi_max=phi_max,
         tol_pos=tol_pos,
-        max_iter=40,
+        debug_plot=debug_plot,
+        plot_on_failure=plot_on_failure,
+        plot_scan_points=plot_scan_points,
+        plot_filename=plot_filename,
+        show_plot=show_plot,
     )
 
-    phi_deg = np.rad2deg(phi_sol)
 
-    print("=== Wind-aware bank angle solution ===")
-    print(f"Converged:         {info['converged']}")
-    print(f"Bank angle φ:      {phi_deg:.2f} deg")
-    print(f"Closest distance:  {info['d_min']:.1f} m")
-    print(f"Signed error:      {info['err']:.1f} m")
-    print(f"Time of c.a.:      {info['t_min']:.1f} s")
-    print(f"Bracket [deg]:     "
-          f"[{np.rad2deg(info['bracket'][0]):.1f}, "
-          f"{np.rad2deg(info['bracket'][1]):.1f}]")
-
-    # -------------------------
-    # Build parameters object for trajectory plotting
-    # -------------------------
-    Vw_x = V_w * np.sin(theta_wa + np.pi)
-    Vw_y = V_w * np.cos(theta_wa + np.pi)
-
-    p = TurnWithWindParams(
-        x0=x0,
-        y0=y0,
-        psi0=psi0,
-        g=g,
-        V_TAS=V_TAS,
-        Vw_x=Vw_x,
-        Vw_y=Vw_y,
+def _finalize_roll_solution(
+    phi_solution,
+    info,
+    p,
+    xt,
+    yt,
+    t_max,
+    dt,
+    phi_max,
+    tol_pos,
+    debug_plot,
+    plot_on_failure,
+    plot_scan_points,
+    plot_filename,
+    show_plot,
+):
+    """
+    Store the selected trajectory and optionally generate a debug plot.
+    """
+    _, _, _, trajectory = closest_approach_error_with_roll(
+        phi_cmd=phi_solution,
+        p=p,
+        xt=xt,
+        yt=yt,
+        t_max=t_max,
+        dt=dt,
+        return_details=True,
     )
 
-    # -------------------------
-    # Trajectory only up to target hit / closest approach
-    # -------------------------
-    # We stop at the time of closest approach given by the solver.
-    # This is effectively the "hit time" within tol_pos.
-    t_hit = min(info["t_min"], t_search)
-    # Choose a reasonable number of points; scales with t_hit
-    n_pts = max(200, int(5 * t_hit))
-    t_traj = np.linspace(0.0, t_hit, n_pts)
+    info["trajectory"] = trajectory
 
-    # (1) Optimal bank with wind, truncated at t_hit
-    x_opt, y_opt = position_with_wind_const_bank(t_traj, phi_sol, p)
+    info["debug_context"] = {
+        "params": p,
+        "xt": float(xt),
+        "yt": float(yt),
+        "t_max": float(t_max),
+        "dt": float(dt),
+        "phi_max": float(phi_max),
+        "tol_pos": float(tol_pos),
+    }
 
-    # (2) Wings-level reference (φ = 0), also truncated at t_hit
-    x_straight, y_straight = position_with_wind_const_bank(t_traj, 0.0, p)
+    closest = trajectory["closest"]
 
-    # Point of closest approach on optimal trajectory (should be ~ last point)
-    x_ca, y_ca = position_with_wind_const_bank(t_hit, phi_sol, p)
+    if closest["at_end"]:
+        info["warning"] = (
+            "Selected closest approach occurs at t_max. "
+            "The aircraft may still be approaching the target; "
+            "increase t_max."
+        )
+    elif closest["at_start"]:
+        info["warning"] = (
+            "Selected closest approach occurs at t=0. "
+            "The aircraft immediately moves away from the target."
+        )
+    elif closest["used_global_fallback"]:
+        info["warning"] = (
+            "No interior local minimum was detected. "
+            "The global sampled minimum was used."
+        )
 
-    # -------------------------
-    # Plot
-    # -------------------------
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-#     ax.plot(x_straight, y_straight, "0.7", label="Wings-level (with wind)")
-    ax.plot(x_opt, y_opt, "b-", label=f"Wind-aware φ ≈ {phi_deg:.1f}°")
-
-    ax.plot([x0], [y0], "go", label="Start")
-    ax.plot([xt], [yt], "rx", ms=10, mew=2, label="Target")
-    ax.plot([x_ca], [y_ca], "m*", ms=12, label="Closest approach / hit")
-
-    ax.set_aspect("equal", "box")
-    ax.grid(True, linestyle="--", alpha=0.5)
-    ax.set_xlabel("x East [m]")
-    ax.set_ylabel("y North [m]")
-    ax.set_title(
-        "Ground track with wind (trajectory stops at target hit / closest approach)"
+    should_plot = debug_plot or (
+        plot_on_failure and not info["converged"]
     )
-    ax.legend(loc="best")
 
-    plt.tight_layout()
-    plt.show()
-    
-def run_example_with_roll(constants, start, end, psi0, phi0, roll_rate):
-    g, V_TAS, bank_angle, V_w, theta_wa, dt = constants
-    x0, y0 = start
-    xt, yt = end
+    if should_plot:
+        figure = plot_roll_solution_debug(
+            info=info,
+            scan_points=plot_scan_points,
+            filename=plot_filename,
+            show=show_plot,
+        )
+        info["debug_figure"] = figure
 
-    t_search = 300.0
-    phi_max = np.deg2rad(89.0)
-    tol_pos = 0.5
-    p_max_roll = roll_rate
+    return float(phi_solution), info
 
-    # Solve bank command with roll dynamics
+
+# ============================================================
+# 8. Diagnostic plotting
+# ============================================================
+
+def generate_bank_error_scan(info, scan_points=121):
+    """
+    Evaluate signed closest-approach error across the full bank range.
+
+    This is useful for detecting:
+    - multiple roots
+    - discontinuous jumps caused by switching local minima
+    - roots that exist even though the two endpoints have the same sign
+    - closest approaches at t_max
+    """
+    context = info["debug_context"]
+
+    p = context["params"]
+    xt = context["xt"]
+    yt = context["yt"]
+    t_max = context["t_max"]
+    dt = context["dt"]
+    phi_max = context["phi_max"]
+
+    scan_points = max(3, int(scan_points))
+
+    phi_scan = np.linspace(-phi_max, phi_max, scan_points)
+
+    err_scan = np.empty(scan_points)
+    d_min_scan = np.empty(scan_points)
+    t_min_scan = np.empty(scan_points)
+    boundary_scan = np.zeros(scan_points, dtype=bool)
+    fallback_scan = np.zeros(scan_points, dtype=bool)
+
+    for i, phi_cmd in enumerate(phi_scan):
+        err, t_min, d_min, details = closest_approach_error_with_roll(
+            phi_cmd=phi_cmd,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            return_details=True,
+        )
+
+        err_scan[i] = err
+        d_min_scan[i] = d_min
+        t_min_scan[i] = t_min
+
+        closest = details["closest"]
+
+        boundary_scan[i] = (
+            closest["at_start"]
+            or closest["at_end"]
+        )
+
+        fallback_scan[i] = closest["used_global_fallback"]
+
+    return {
+        "phi": phi_scan,
+        "err": err_scan,
+        "d_min": d_min_scan,
+        "t_min": t_min_scan,
+        "boundary": boundary_scan,
+        "fallback": fallback_scan,
+    }
+
+
+def plot_roll_solution_debug(
+    info,
+    scan_points=121,
+    filename=None,
+    show=True,
+):
+    """
+    Plot trajectory and solver diagnostics.
+
+    Parameters
+    ----------
+    info : dict
+        Information returned by desired_bank_to_point_with_wind_roll().
+
+    scan_points : int
+        Number of bank commands used for the error scan.
+
+    filename : str or None
+        Save the figure if a filename is supplied.
+
+    show : bool
+        Call plt.show() if True.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The created figure.
+    """
+    if "trajectory" not in info:
+        raise ValueError(
+            "info does not contain trajectory data. "
+            "Use desired_bank_to_point_with_wind_roll()."
+        )
+
+    context = info["debug_context"]
+
+    p = context["params"]
+    xt = context["xt"]
+    yt = context["yt"]
+    t_max = context["t_max"]
+    dt = context["dt"]
+    phi_max = context["phi_max"]
+    tol_pos = context["tol_pos"]
+
+    selected = info["trajectory"]
+    closest = selected["closest"]
+
+    t = selected["t"]
+    x = selected["x"]
+    y = selected["y"]
+    psi = selected["psi"]
+    phi = selected["phi"]
+
+    phi_solution = info["phi_solution"]
+
+    # Comparison trajectories
+    comparison_commands = [
+        ("Wings level", 0.0, "0.45", "--"),
+        ("Left limit", -phi_max, "tab:orange", ":"),
+        ("Right limit", phi_max, "tab:green", ":"),
+    ]
+
+    comparison_trajectories = []
+
+    for name, phi_cmd, color, linestyle in comparison_commands:
+        if abs(phi_cmd - phi_solution) < 1e-10:
+            continue
+
+        _, _, _, details = closest_approach_error_with_roll(
+            phi_cmd=phi_cmd,
+            p=p,
+            xt=xt,
+            yt=yt,
+            t_max=t_max,
+            dt=dt,
+            return_details=True,
+        )
+
+        comparison_trajectories.append(
+            (name, phi_cmd, color, linestyle, details)
+        )
+
+    scan = generate_bank_error_scan(
+        info,
+        scan_points=scan_points,
+    )
+
+    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
+    grid = fig.add_gridspec(2, 3)
+
+    ax_trajectory = fig.add_subplot(grid[:, 0])
+    ax_bank = fig.add_subplot(grid[0, 1])
+    ax_distance = fig.add_subplot(grid[1, 1])
+    ax_error = fig.add_subplot(grid[0, 2])
+    ax_tmin = fig.add_subplot(grid[1, 2])
+
+    # --------------------------------------------------------
+    # Trajectory plot
+    # --------------------------------------------------------
+    for name, phi_cmd, color, linestyle, details in comparison_trajectories:
+        ax_trajectory.plot(
+            details["x"],
+            details["y"],
+            color=color,
+            linestyle=linestyle,
+            linewidth=1.2,
+            alpha=0.75,
+            label=f"{name}: {np.rad2deg(phi_cmd):.1f}°",
+        )
+
+    ax_trajectory.plot(
+        x,
+        y,
+        color="tab:blue",
+        linewidth=2.5,
+        label=(
+            f"Selected: {np.rad2deg(phi_solution):.2f}°"
+        ),
+    )
+
+    ax_trajectory.scatter(
+        p.x0,
+        p.y0,
+        s=80,
+        color="black",
+        marker="o",
+        zorder=6,
+        label="Initial position",
+    )
+
+    ax_trajectory.scatter(
+        xt,
+        yt,
+        s=180,
+        color="red",
+        marker="*",
+        edgecolor="black",
+        linewidth=0.8,
+        zorder=8,
+        label="Target",
+    )
+
+    closest_state = closest["state"]
+
+    ax_trajectory.scatter(
+        closest_state["x"],
+        closest_state["y"],
+        s=90,
+        color="cyan",
+        marker="o",
+        edgecolor="black",
+        linewidth=0.8,
+        zorder=8,
+        label="Selected closest approach",
+    )
+
+    ax_trajectory.plot(
+        [closest_state["x"], xt],
+        [closest_state["y"], yt],
+        color="red",
+        linewidth=1.5,
+        linestyle="--",
+        label=f"Miss distance: {closest['d_min']:.2f} m",
+    )
+
+    # Initial heading arrow
+    trajectory_scale = max(
+        np.ptp(np.concatenate([x, np.array([xt])])),
+        np.ptp(np.concatenate([y, np.array([yt])])),
+        1.0,
+    )
+
+    heading_arrow_length = 0.10 * trajectory_scale
+
+    heading_dx = heading_arrow_length * np.sin(p.psi0)
+    heading_dy = heading_arrow_length * np.cos(p.psi0)
+
+    ax_trajectory.arrow(
+        p.x0,
+        p.y0,
+        heading_dx,
+        heading_dy,
+        width=0.004 * trajectory_scale,
+        head_width=0.025 * trajectory_scale,
+        head_length=0.035 * trajectory_scale,
+        color="black",
+        length_includes_head=True,
+        zorder=7,
+    )
+
+    # Wind arrow: displacement caused by five seconds of wind
+    wind_arrow_time = 5.0
+    wind_dx = p.Vw_x * wind_arrow_time
+    wind_dy = p.Vw_y * wind_arrow_time
+
+    if np.hypot(wind_dx, wind_dy) > 1e-9:
+        ax_trajectory.arrow(
+            p.x0,
+            p.y0,
+            wind_dx,
+            wind_dy,
+            width=0.003 * trajectory_scale,
+            head_width=0.020 * trajectory_scale,
+            head_length=0.030 * trajectory_scale,
+            color="magenta",
+            length_includes_head=True,
+            zorder=7,
+        )
+
+        ax_trajectory.text(
+            p.x0 + wind_dx,
+            p.y0 + wind_dy,
+            "  wind × 5 s",
+            color="magenta",
+            fontsize=9,
+        )
+
+    ax_trajectory.set_xlabel("East, x [m]")
+    ax_trajectory.set_ylabel("North, y [m]")
+    ax_trajectory.set_title("Ground trajectories")
+    ax_trajectory.axis("equal")
+    ax_trajectory.grid(True, alpha=0.3)
+    ax_trajectory.legend(fontsize=8, loc="best")
+
+    # --------------------------------------------------------
+    # Bank and heading
+    # --------------------------------------------------------
+    ax_bank.plot(
+        t,
+        np.rad2deg(phi),
+        color="tab:blue",
+        linewidth=2.0,
+        label="Bank",
+    )
+
+    ax_bank.axhline(
+        np.rad2deg(phi_solution),
+        color="tab:blue",
+        linestyle="--",
+        alpha=0.6,
+        label="Commanded bank",
+    )
+
+    ax_bank.axvline(
+        closest["t_min"],
+        color="red",
+        linestyle=":",
+        label="Closest approach",
+    )
+
+    ax_bank.set_xlabel("Time [s]")
+    ax_bank.set_ylabel("Bank [deg]", color="tab:blue")
+    ax_bank.tick_params(axis="y", labelcolor="tab:blue")
+    ax_bank.grid(True, alpha=0.3)
+
+    ax_heading = ax_bank.twinx()
+
+    ax_heading.plot(
+        t,
+        np.rad2deg(np.unwrap(psi)),
+        color="tab:orange",
+        linewidth=1.5,
+        alpha=0.85,
+        label="Heading",
+    )
+
+    ax_heading.set_ylabel(
+        "Unwrapped heading [deg]",
+        color="tab:orange",
+    )
+    ax_heading.tick_params(axis="y", labelcolor="tab:orange")
+
+    ax_bank.set_title("Bank and heading")
+
+    bank_handles, bank_labels = ax_bank.get_legend_handles_labels()
+    heading_handles, heading_labels = ax_heading.get_legend_handles_labels()
+
+    ax_bank.legend(
+        bank_handles + heading_handles,
+        bank_labels + heading_labels,
+        fontsize=8,
+        loc="best",
+    )
+
+    # --------------------------------------------------------
+    # Distance versus time
+    # --------------------------------------------------------
+    distance = closest["distance"]
+
+    ax_distance.plot(
+        t,
+        distance,
+        color="tab:purple",
+        linewidth=2.0,
+        label="Distance to target",
+    )
+
+    local_indices = closest["local_min_indices"]
+
+    if local_indices.size > 0:
+        ax_distance.scatter(
+            t[local_indices],
+            distance[local_indices],
+            color="tab:orange",
+            marker="x",
+            s=45,
+            label="Detected local minima",
+            zorder=6,
+        )
+
+    ax_distance.scatter(
+        closest["t_min"],
+        closest["d_min"],
+        color="red",
+        s=70,
+        zorder=7,
+        label="Selected minimum",
+    )
+
+    ax_distance.axvline(
+        closest["t_min"],
+        color="red",
+        linestyle=":",
+    )
+
+    ax_distance.axhline(
+        tol_pos,
+        color="green",
+        linestyle="--",
+        alpha=0.7,
+        label="Position tolerance",
+    )
+
+    ax_distance.set_xlabel("Time [s]")
+    ax_distance.set_ylabel("Distance to target [m]")
+    ax_distance.set_title(
+        "Target distance versus time\n"
+        f"Selected minimum: {closest['minimum_location']}"
+    )
+    ax_distance.grid(True, alpha=0.3)
+    ax_distance.legend(fontsize=8, loc="best")
+
+    # --------------------------------------------------------
+    # Signed error versus commanded bank
+    # --------------------------------------------------------
+    phi_scan_deg = np.rad2deg(scan["phi"])
+
+    ax_error.plot(
+        phi_scan_deg,
+        scan["err"],
+        color="black",
+        linewidth=1.5,
+        label="Signed closest-approach error",
+    )
+
+    ax_error.axhline(
+        0.0,
+        color="black",
+        linewidth=1.0,
+    )
+
+    ax_error.axhspan(
+        -tol_pos,
+        tol_pos,
+        color="green",
+        alpha=0.12,
+        label="Position tolerance",
+    )
+
+    history_phi = np.array(
+        [item["phi"] for item in info["history"]],
+        dtype=float,
+    )
+
+    history_err = np.array(
+        [item["err"] for item in info["history"]],
+        dtype=float,
+    )
+
+    ax_error.scatter(
+        np.rad2deg(history_phi),
+        history_err,
+        color="tab:orange",
+        edgecolor="black",
+        linewidth=0.4,
+        s=40,
+        zorder=7,
+        label="Solver evaluations",
+    )
+
+    ax_error.scatter(
+        np.rad2deg(phi_solution),
+        info["err"],
+        color="red",
+        marker="*",
+        edgecolor="black",
+        linewidth=0.7,
+        s=170,
+        zorder=8,
+        label="Selected command",
+    )
+
+    boundary_indices = np.nonzero(scan["boundary"])[0]
+
+    if boundary_indices.size > 0:
+        ax_error.scatter(
+            phi_scan_deg[boundary_indices],
+            scan["err"][boundary_indices],
+            facecolors="none",
+            edgecolors="magenta",
+            linewidth=1.0,
+            s=50,
+            label="Minimum at time boundary",
+        )
+
+    ax_error.set_xlabel("Commanded bank [deg]")
+    ax_error.set_ylabel("Signed error [m]")
+    ax_error.set_title("Bank-command error function")
+    ax_error.grid(True, alpha=0.3)
+    ax_error.legend(fontsize=8, loc="best")
+
+    # --------------------------------------------------------
+    # Closest-approach time versus bank
+    # --------------------------------------------------------
+    ax_tmin.plot(
+        phi_scan_deg,
+        scan["t_min"],
+        color="tab:green",
+        linewidth=1.5,
+        label="Closest-approach time",
+    )
+
+    ax_tmin.axhline(
+        t_max,
+        color="red",
+        linestyle="--",
+        alpha=0.7,
+        label="t_max",
+    )
+
+    ax_tmin.scatter(
+        np.rad2deg(phi_solution),
+        info["t_min"],
+        color="red",
+        marker="*",
+        edgecolor="black",
+        linewidth=0.7,
+        s=150,
+        zorder=8,
+        label="Selected command",
+    )
+
+    if boundary_indices.size > 0:
+        ax_tmin.scatter(
+            phi_scan_deg[boundary_indices],
+            scan["t_min"][boundary_indices],
+            facecolors="none",
+            edgecolors="magenta",
+            linewidth=1.0,
+            s=50,
+            label="Boundary minimum",
+        )
+
+    ax_tmin.set_xlabel("Commanded bank [deg]")
+    ax_tmin.set_ylabel("Closest-approach time [s]")
+    ax_tmin.set_title("Selected closest-approach time")
+    ax_tmin.grid(True, alpha=0.3)
+    ax_tmin.legend(fontsize=8, loc="best")
+
+    # --------------------------------------------------------
+    # Figure title
+    # --------------------------------------------------------
+    if info["converged"]:
+        status = "CONVERGED"
+    else:
+        status = f"NOT CONVERGED: {info.get('reason', 'unknown')}"
+
+    title = (
+        f"Wind-aware bank solver debug — {status}\n"
+        f"phi_cmd={np.rad2deg(phi_solution):.3f} deg, "
+        f"signed error={info['err']:.3f} m, "
+        f"distance={info['d_min']:.3f} m, "
+        f"t_min={info['t_min']:.3f} s"
+    )
+
+    if "warning" in info:
+        title += f"\nWarning: {info['warning']}"
+
+    fig.suptitle(title, fontsize=13)
+
+    if filename is not None:
+        fig.savefig(filename, dpi=160, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    return fig
+
+
+# ============================================================
+# 9. Example
+# ============================================================
+
+if __name__ == "__main__":
+    # Initial aircraft state
+    x0 = 697075.2887876498
+    y0 = 6084791.098685207
+    psi0 = 3.8823103881361867 #np.deg2rad(0.0)       # North
+    phi0 = 0.6994298696517944 #np.deg2rad(0.0)
+
+    # Target
+    xt = 697037.7793601836
+    yt = 6084771.4720707415
+
+    # Aircraft/environment
+    g = 9.80665
+    V_TAS = 17.5 * 1.069
+
+    # Wind from West, therefore blowing toward East
+    V_w = 8.75
+    theta_wa = np.deg2rad(30.0)
+
     phi_cmd, info = desired_bank_to_point_with_wind_roll(
         x0=x0,
         y0=y0,
@@ -942,67 +1799,35 @@ def run_example_with_roll(constants, start, end, psi0, phi0, roll_rate):
         V_TAS=V_TAS,
         V_w=V_w,
         theta_wa=theta_wa,
-        p_max_roll=p_max_roll,
-        t_max=t_search,
-        dt=dt,
-        phi_max=phi_max,
-        tol_pos=tol_pos,
+        p_max_roll=np.deg2rad(15.0),
+        t_max=5.0,
+        dt=0.005,
+        phi_max=np.deg2rad(40.0),
+        tol_pos=0.1,
         max_iter=40,
+
+        # Plot every call:
+        debug_plot=True,
+
+        # Alternatively, set debug_plot=False and this to True:
+        plot_on_failure=True,
+
+        plot_scan_points=121,
+        plot_filename=None,
+        show_plot=True,
     )
 
-    phi_deg = np.rad2deg(phi_cmd)
-    print("=== Wind-aware bank (with roll dynamics, no roll-out) ===")
-    print(f"Converged:         {info['converged']}")
-    print(f"Commanded φ:       {phi_deg:.2f} deg")
-    print(f"Closest distance:  {info['d_min']:.1f} m")
-    print(f"Signed error:      {info['err']:.1f} m")
-    print(f"Time of c.a.:      {info['t_min']:.1f} s")
-    print(
-        f"Bracket [deg]:     "
-        f"[{np.rad2deg(info['bracket'][0]):.1f}, "
-        f"{np.rad2deg(info['bracket'][1]):.1f}]"
-    )
+    print()
+    print("Solver result")
+    print("-------------")
+    print(f"Bank command : {np.rad2deg(phi_cmd):.6f} deg")
+    print(f"Converged    : {info['converged']}")
+    print(f"Signed error : {info['err']:.6f} m")
+    print(f"Miss distance: {info['d_min']:.6f} m")
+    print(f"Closest time : {info['t_min']:.6f} s")
 
-    # Rebuild params and simulate trajectory to t_hit
-    Vw_x = V_w * np.sin(theta_wa + np.pi)
-    Vw_y = V_w * np.cos(theta_wa + np.pi)
-    p_roll = TurnWithWindRollParams(
-        x0=x0,
-        y0=y0,
-        psi0=psi0,
-        phi0=phi0,
-        g=g,
-        V_TAS=V_TAS,
-        Vw_x=Vw_x,
-        Vw_y=Vw_y,
-        p_max=p_max_roll,
-    )
+    if "reason" in info:
+        print(f"Failure reason: {info['reason']}")
 
-    t_hit = min(info["t_min"], t_search)
-    t_traj, x_traj, y_traj, psi_traj, phi_traj = trajectory_with_wind_roll(
-        phi_cmd, p_roll, t_final=t_hit, dt=dt
-    )
-
-    # Wings-level reference with same roll model (phi_cmd = 0)
-    t_ws, x_ws, y_ws, _, _ = trajectory_with_wind_roll(
-        0.0, p_roll, t_final=t_hit, dt=dt
-    )
-
-    x_ca = x_traj[-1]
-    y_ca = y_traj[-1]
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.plot(x_ws, y_ws, "0.7", label="Wings-level (with wind & roll model)")
-    ax.plot(x_traj, y_traj, "b-", label=f"Wind-aware φ_cmd ≈ {phi_deg:.1f}°")
-    ax.plot([x0], [y0], "go", label="Start")
-    ax.plot([xt], [yt], "rx", ms=10, mew=2, label="Target")
-    ax.plot([x_ca], [y_ca], "m*", ms=12, label="Closest approach / hit")
-
-    ax.set_aspect("equal", "box")
-    ax.grid(True, linestyle="--", alpha=0.5)
-    ax.set_xlabel("x East [m]")
-    ax.set_ylabel("y North [m]")
-    ax.set_title("Ground track with wind and roll dynamics (no roll-out)")
-    ax.legend(loc="best")
-    plt.tight_layout()
-    plt.show()
+    if "warning" in info:
+        print(f"Warning       : {info['warning']}")
