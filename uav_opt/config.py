@@ -44,10 +44,10 @@ class AircraftConfig:
     Aircraft and maneuver limits.
     """
 
-    airspeed_mps: float = 18.5
-    roll_rate_rad_s: float = np.deg2rad(30.0)
+    airspeed_mps: float = 17.5
+    roll_rate_rad_s: float = np.deg2rad(15.0)
     min_bank_rad: float = np.deg2rad(5.0)
-    max_bank_rad: float = np.deg2rad(45.0)
+    max_bank_rad: float = np.deg2rad(40.0)
     max_bank_optimizer_rad: float = np.deg2rad(35.0)
     aero: AeroConfig = AeroConfig()
 
@@ -58,10 +58,11 @@ class L1Config:
     L1 path-following and wind configuration.
     """
 
-    wind_speed_mps: float = 10.0
-    wind_from_direction_rad: float = np.deg2rad(0.0)
+    wind_speed_mps: float = 8.75
+    wind_from_direction_rad: float = np.deg2rad(20.0)
     
 
+    xtrack_i_gain: float = 0.20
     damping: float = 1.0 / np.sqrt(2.0)
     period_s: float = 10.0
     dt_s: float = 0.05
@@ -71,8 +72,8 @@ class L1Config:
     # Only for LW Controller
     use_wind_aware_bank_solver: bool = True 
     tol_pos=0.1
-    dt_solver=0.002
-    max_iter = 40
+    dt_solver=0.01
+    max_iter = 100
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class ExecutionConfig:
     connection_string: str = "udp:0.0.0.0:14550"
     temp_mission_file: str = "temp.waypoints"
 
-    evaluate_before_flight: bool = True
+    evaluate_before_flight: bool = False
     internal_sim_time_s: float = 500.0
     guidance_max_time_s: float = 500.0
 
